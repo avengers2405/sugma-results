@@ -24,8 +24,9 @@ export function UploadPanel({ onUploaded }) {
       try {
         const fd = new FormData()
         fd.append("file", file)
-        const res = await fetch("/api/upload", { method: "POST", body: fd })
-        if (!res.ok) throw new Error("Upload failed")
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:6000"
+        const res = await fetch(`${backendUrl}/upload/chat`, { method: "POST", body: fd })
+        if (!res.ok) throw new Error(`Upload failed: ${res.status} ${res.statusText}`)
         toast({ title: "Uploaded", description: "Your file was uploaded successfully." })
         onUploaded?.()
       } catch (e) {

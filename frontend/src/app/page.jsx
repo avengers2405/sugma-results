@@ -9,6 +9,7 @@ import { AnalysisControls } from "@/components/analysis-controls"
 import { StudentsTable } from "@/components/students-table"
 import { cn } from "@/lib/utils"
 
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:6000"
 const fetcher = (url) => fetch(url).then((res) => res.json())
 
 export default function Page() {
@@ -23,7 +24,7 @@ export default function Page() {
     return usp.toString()
   }, [range, includeNonDream])
 
-  const { data, isLoading } = useSWR(`/api/students?${params}`, fetcher, {
+  const { data, isLoading } = useSWR(`${backendUrl}/student/unplaced?${params}`, fetcher, {
     revalidateOnFocus: false,
     keepPreviousData: true,
   })
