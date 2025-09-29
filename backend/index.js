@@ -2,7 +2,11 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import multer from 'multer';
+import { Pool } from 'pg';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -12,9 +16,14 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 6000;
 const API_KEY = process.env.GEMINI_KEY;
+const DB_URL = process.env.POSTGRES_DB_LINK;
 
 if (!API_KEY) {
     throw new Error("GEMINI_KEY environment variable is not set.");
+}
+
+if (!DB_URL) {
+    throw new Error("POSTGRES_DB_LINK environment variable is not set.");
 }
 
 const gemini = new GoogleGenerativeAI(API_KEY);
@@ -145,11 +154,59 @@ const chat = model.startChat({
     ],
 });
 
+const pool = new Pool({
+    connectionString: DB_URL,
+});
+
 app.use(cors());
 app.use(express.json());
 
 // Configure multer to store file in memory
 const upload = multer({ storage: multer.memoryStorage() });
+
+async function uploadStudents(){
+    try {
+        // Get current directory path (needed for ES modules)
+        const __filename = fileURLToPath(import.meta.url);
+        const __dirname = path.dirname(__filename);
+        
+        // Read the TE_names.txt file
+        const filePath = path.join(__dirname, 'TE_names.txt');
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        
+        // Split by lines and filter out empty lines
+        const names = fileContent.split('\n')
+            .map(name => name.trim())
+            .filter(name => name.length > 0);
+        
+        console.log(`Found ${names.length} names to upload`);
+        
+        let successCount = 0;
+        let errorCount = 0;
+        
+        // Insert each name into the Students table
+        for (const name of names) {
+            try {
+                await pool.query(
+                    'INSERT INTO Students (student_name) VALUES ($1)',
+                    [name]
+                );
+                successCount++;
+            } catch (error) {
+                errorCount++;
+                console.log(`✗ Failed to insert: ${name} - ${error.message}`);
+                // Continue to next name without stopping
+            }
+        }
+        
+        console.log(`Upload complete: ${successCount} successful, ${errorCount} failed`);
+        return { success: successCount, failed: errorCount, total: names.length };
+        
+    } catch (error) {
+        console.error('Error in uploadStudents:', error);
+        throw error;
+    }
+}
 
 // Store parsed messages globally (in production, use a database)
 let filteredMessages = [];
@@ -249,6 +306,7 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
     }
 });
 
-app.listen(PORT, ()=>{
+app.listen(PORT, async ()=>{
     console.log(`happi server at ${PORT}`);
+    // await uploadStudents();
 })
