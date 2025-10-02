@@ -7,6 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { parse } from 'date-fns';
 
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -17,6 +18,8 @@ const app = express();
 const PORT = process.env.PORT || 6000;
 const API_KEY = process.env.GEMINI_KEY;
 const DB_URL = process.env.POSTGRES_DB_LINK;
+const lastProcessedPlacement = parse("8/5/25, 12:18 PM", "M/d/yy, h:mm a", new Date()); // this needs to be monitored and updated manually
+const BATCH_SIZE = 10;
 
 if (!API_KEY) {
     throw new Error("GEMINI_KEY environment variable is not set.");
@@ -260,8 +263,212 @@ async function uploadStudents(){
 }
 
 // Store parsed messages globally (in production, use a database)
-let filteredMessages = [];
-let parsedMessages = [];
+// let filteredMessages = [];
+// let parsedMessages = [];
+
+async function parseMessage(filteredMessages){
+    let parsedMessages = [];
+    for (let index = 0; index < filteredMessages.length; index++) {
+        // getting students name
+        let parsedMessageUpdated = false;
+        const message = filteredMessages[index];
+        console.log("Trying for index: ", index);
+        while (true){
+            try{
+                const result = await student_chat.sendMessage(message);
+                const response = await result.response;
+                const jsonResponse = JSON.parse(response.text());
+                if (jsonResponse.students.length>0){
+                    parsedMessages.push(jsonResponse);
+                    console.log("added new entry: ", JSON.stringify(jsonResponse));
+                    parsedMessageUpdated = true;
+                }
+                console.log(JSON.stringify(jsonResponse));
+                console.log("\n\n#####\n\n");
+                break;
+            } catch (e){
+                console.log("Error in calling gemini api: ", e);
+                
+                // Extract retry delay from Google AI API error if it is provided
+                let retryDelayMs = 2000; // default 2 seconds
+                
+                if (e.errorDetails && Array.isArray(e.errorDetails)) {
+                    const retryInfo = e.errorDetails.find(detail => 
+                        detail['@type'] == 'type.googleapis.com/google.rpc.RetryInfo'
+                    );
+                    
+                    if (retryInfo && retryInfo.retryDelay) {
+                        const delayStr = retryInfo.retryDelay;
+                        const delaySeconds = parseFloat(delayStr.replace('s', ''));
+                        retryDelayMs = Math.ceil(delaySeconds * 1000 + 1500);
+                    }
+                }
+                
+                console.log(`Waiting for ${retryDelayMs}ms before retrying...`);
+                await sleep(retryDelayMs);
+            }
+        }
+
+        // inserting company into Companies table if not present
+        if (parsedMessageUpdated) {
+            while (true) {
+                try{
+                    const res = await pool.query(
+                        'SELECT company_name FROM Companies'
+                    )
+                    let companiesTemp=[];
+                    res.rows.forEach((obj) => {
+                        companiesTemp.push(obj.company_name);
+                    })
+                    console.log(JSON.stringify(companiesTemp));
+                    const result2 = await company_chat.sendMessage(JSON.stringify(companiesTemp)+`${parsedMessages.at(-1).company}`);
+                    const response2 = await result2.response;
+                    const jsonResponse2 = JSON.parse(response2.text());
+                    // const targetCompany = jsonResponse2.company_name==""?parsedMessages.at(-1).company:jsonResponse2.company_name;
+                    if (jsonResponse2.company_name == "") {
+                        // need to add company to companies table first
+                        await pool.query(
+                            "INSERT INTO Companies (company_name) VALUES ($1)",
+                            [parsedMessages.at(-1).company]
+                        )
+                    } else {
+                        if (jsonResponse2.company_name!=parsedMessages.at(-1).company) {
+                            await pool.query(
+                                "INSERT INTO company_alias (company_id, company_name) VALUES ((SELECT id FROM companies WHERE company_name=($1)), ($2))",
+                                [jsonResponse2.company_name, parsedMessages.at(-1).company]
+                            )
+                        }
+                    }
+                    break;
+                } catch (e){
+                    console.log("Error in company matching logic: ", e);
+                    
+                    // Extract retry delay from Google AI API error if it is provided
+                    let retryDelayMs = 2000; // default 2 seconds
+                    
+                    if (e.errorDetails && Array.isArray(e.errorDetails)) {
+                        const retryInfo = e.errorDetails.find(detail => 
+                            detail['@type'] == 'type.googleapis.com/google.rpc.RetryInfo'
+                        );
+                        
+                        if (retryInfo && retryInfo.retryDelay) {
+                            const delayStr = retryInfo.retryDelay;
+                            const delaySeconds = parseFloat(delayStr.replace('s', ''));
+                            retryDelayMs = Math.ceil(delaySeconds * 1000 + 1500);
+                        }
+                    }
+                    
+                    console.log(`Waiting for ${retryDelayMs}ms before retrying...`);
+                    await sleep(retryDelayMs);
+                }
+
+                await sleep(1000); // to prevent while loop from going wild
+            }
+        }
+    }
+    
+    console.log(`Parsed ${parsedMessages.length} messages from the chat file`);
+
+    // parsedMessages.forEach(async (obj) => {
+    for (let i=0; i<parsedMessages.length; i++) {
+        const obj = parsedMessages[i];
+        console.log("Processing element: ", JSON.stringify(obj));
+        let allStudentObj = [];
+        const result = await pool.query(
+            "SELECT * FROM students"
+        )
+        result.rows.forEach((sobj) => {
+            allStudentObj.push(sobj);
+        })
+
+        let cid = -1;
+        while (true){
+            try {
+                const result = await pool.query(
+                    "SELECT company_id FROM company_alias WHERE company_name=($1)",
+                    [obj.company]
+                )
+                if (result.rows.length==0) {
+                    throw new Error(`No company found in alias table for name: ${obj.company}`);
+                }
+                cid = result.rows[0].company_id;
+                break;
+            } catch (e){
+                console.log("Error in finding company in alias table: ", e);
+            }
+
+            await sleep(1000); // to prevent while loop from going wild
+        }
+
+        // obj.students.forEach((student) => {
+        for (let j=0; j<obj.students.length; j++) {
+            const student = obj.students[j];
+            console.log("checking for student: ", student, " done", student.split(" "));
+            let sid = -1;
+            while (true) {
+                try {
+                    let matched_ids = [];
+                    allStudentObj.forEach((sobj) => {
+                        const pool_tokens = sobj.student_name.split(" ");
+                        const target_tokens = student.split(" ");
+                        // console.log("Target tokens: ", target_tokens)
+                        let matched = 0;
+                        pool_tokens.forEach((token) => {
+                            target_tokens.forEach((ttoken) => {
+                                if (token.toLowerCase().trim() == ttoken.toLowerCase().trim()){
+                                    // console.log("Matched: ", token, ttoken)
+                                    matched+=1;
+                                    // console.log(" and count: ", matched)
+                                }
+                            })
+                        })
+
+                        // add according to match percentage
+                        if (matched/(target_tokens.length)>0.5) {
+                            matched_ids.push({match: matched/(target_tokens.length), id: sobj.id});
+                        }
+                    })
+
+                    const sorted_matched_ids = matched_ids.sort((a, b) => b.match - a.match);
+                    if (matched_ids.length==1) {
+                        sid = matched_ids[0].id;
+                    } else if (matched_ids.length==0) {
+                        // throw new Error("NO MATCH FOR STUDENT : " + student);
+                        await pool.query(
+                            "INSERT INTO not_found_students (student_name) VALUES ($1) ON CONFLICT (student_name) DO NOTHING",
+                            [student]
+                        )
+                        console.log("NO MATCH FOR STUDENT : ", student);
+                    } else {
+                        console.log("MULTIPLE MATCHES FOR STUDENT: ", student, " MATCHES: ", JSON.stringify(matched_ids));
+                        if (sorted_matched_ids[0].match == sorted_matched_ids[1].match) {
+                            // throw new Error("CANNOT DECIDE for this student");
+                            await pool.query(
+                                "INSERT INTO not_found_students (student_name, flag) VALUES ($1, $2) ON CONFLICT (student_name) DO NOTHING",
+                                [student, 1]
+                            )
+                        } else {
+                            sid = sorted_matched_ids[0].id;
+                        }
+                    }
+                    break;
+                } catch (e){
+                    console.log("Error in finding student in students table: ", e);
+                }
+
+                await sleep(2000); // to prevent while loop from going wild
+            }
+
+            if (sid!=-1)
+            await pool.query(
+                "INSERT INTO student_companies (student_id, company_id) VALUES ($1, $2)",
+                [sid, cid]
+            )
+
+            await sleep(1000); // to prevent while loop from going wild
+        }
+    }
+}
 
 app.post('/upload/chat', upload.single('file'), async (req, res) => {
     try {
@@ -291,8 +498,12 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
         // Find all matches and split the text
         while ((match = dateTimePattern.exec(fileContent)) !== null) {
             const messageText = fileContent.substring(lastIndex, match.index).trim();
-            if (messageText) {
-                messages.push(messageText);
+            const messageDateStr = messageText.trim().split('-')[0].trim().replace(' ', ' ');
+            const messageDate = parse(messageDateStr, "M/d/yy, h:mm a", new Date());
+            if (messageDate > lastProcessedPlacement) {
+                if (messageText) {
+                    messages.push(messageText);
+                }
             }
             
             // Update lastIndex to start of current match
@@ -306,6 +517,7 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
         }
 
         // delte admin messages or whatsapp informational messages
+        let filteredMessages = [];
         messages.forEach((message) => {
             if (message.includes("Messages and calls are end-to-end encrypted.") || 
                 message.includes("Shubh Jain created group \"BE IT 2026\"") ||
@@ -319,229 +531,10 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
             }
         })
 
-        for (let index = 0; index < filteredMessages.length; index++) {
+        // now send first BATCH_SIZE messages for parsing.
+        await parseMessage(filteredMessages.slice(0, BATCH_SIZE));
 
-            // getting students name
-            const message = filteredMessages[index];
-            console.log("Trying for index: ", index);
-            while (true){
-                try{
-                    const result = await student_chat.sendMessage(message);
-                    const response = await result.response;
-                    parsedMessages.push(JSON.parse(response.text()));
-                    console.log(JSON.stringify(parsedMessages.at(-1)));
-                    console.log("\n\n#####\n\n");
-                    break;
-                } catch (e){
-                    console.log("Error in calling gemini api: ", e);
-                    
-                    // Extract retry delay from Google AI API error if it is provided
-                    let retryDelayMs = 2000; // default 2 seconds
-                    
-                    if (e.errorDetails && Array.isArray(e.errorDetails)) {
-                        const retryInfo = e.errorDetails.find(detail => 
-                            detail['@type'] == 'type.googleapis.com/google.rpc.RetryInfo'
-                        );
-                        
-                        if (retryInfo && retryInfo.retryDelay) {
-                            const delayStr = retryInfo.retryDelay;
-                            const delaySeconds = parseFloat(delayStr.replace('s', ''));
-                            retryDelayMs = Math.ceil(delaySeconds * 1000 + 1500);
-                        }
-                    }
-                    
-                    console.log(`Waiting for ${retryDelayMs}ms before retrying...`);
-                    await sleep(retryDelayMs);
-                }
-            }
-
-            // inserting company into Companies table if not present
-            if (!parsedMessages.at(-1).company=="") {
-                while (true) {
-                    try{
-                        const res = await pool.query(
-                            'SELECT company_name FROM Companies'
-                        )
-                        let companiesTemp=[];
-                        res.rows.forEach((obj) => {
-                            companiesTemp.push(obj.company_name);
-                        })
-                        console.log(JSON.stringify(companiesTemp));
-                        const result2 = await company_chat.sendMessage(JSON.stringify(companiesTemp)+`${parsedMessages.at(-1).company}`);
-                        const response2 = await result2.response;
-                        const jsonResponse2 = JSON.parse(response2.text());
-                        // const targetCompany = jsonResponse2.company_name==""?parsedMessages.at(-1).company:jsonResponse2.company_name;
-                        if (jsonResponse2.company_name == "") {
-                            // need to add company to companies table first
-                            await pool.query(
-                                "INSERT INTO Companies (company_name) VALUES ($1)",
-                                [parsedMessages.at(-1).company]
-                            )
-                        } else {
-                            if (jsonResponse2.company_name!=parsedMessages.at(-1).company) {
-                                await pool.query(
-                                    "INSERT INTO company_alias (company_id, company_name) VALUES ((SELECT id FROM companies WHERE company_name=($1)), ($2))",
-                                    [jsonResponse2.company_name, parsedMessages.at(-1).company]
-                                )
-                            }
-                        }
-                        break;
-                    } catch (e){
-                        console.log("Error in company matching logic: ", e);
-                        
-                        // Extract retry delay from Google AI API error if it is provided
-                        let retryDelayMs = 2000; // default 2 seconds
-                        
-                        if (e.errorDetails && Array.isArray(e.errorDetails)) {
-                            const retryInfo = e.errorDetails.find(detail => 
-                                detail['@type'] == 'type.googleapis.com/google.rpc.RetryInfo'
-                            );
-                            
-                            if (retryInfo && retryInfo.retryDelay) {
-                                const delayStr = retryInfo.retryDelay;
-                                const delaySeconds = parseFloat(delayStr.replace('s', ''));
-                                retryDelayMs = Math.ceil(delaySeconds * 1000 + 1500);
-                            }
-                        }
-                        
-                        console.log(`Waiting for ${retryDelayMs}ms before retrying...`);
-                        await sleep(retryDelayMs);
-                    }
-
-                    await sleep(1000); // to prevent while loop from going wild
-                }
-            }
-        }
-        
-        console.log(`Parsed ${parsedMessages.length} messages from the chat file`);
-
-        parsedMessages.forEach(async (obj) => {
-            console.log("Processing element: ", JSON.stringify(obj));
-            let allStudentObj = [];
-            const result = await pool.query(
-                "SELECT * FROM students"
-            )
-            result.rows.forEach((sobj) => {
-                allStudentObj.push(sobj);
-            })
-
-            let cid = -1;
-            while (true){
-                try {
-                    const result = await pool.query(
-                        "SELECT id FROM company_alias WHERE company_name=($1)",
-                        [obj.company]
-                    )
-                    if (result.rows.length==0) {
-                        throw new Error(`No company found in alias table for name: ${obj.company}`);
-                    }
-                    cid = result.rows[0].id;
-                    break;
-                } catch (e){
-                    console.log("Error in finding company in alias table: ", e);
-                }
-
-                await sleep(1000); // to prevent while loop from going wild
-            }
-
-            let dream = false;
-            while (true) {
-                try{
-                    const result = await pool.query(
-                        "SELECT dream FROM companies WHERE id=($1)",
-                        [cid]
-                    )
-                    dream = result.rows[0].dream;
-                    break;
-                } catch (e){
-                    console.log("Error in finding if company is dream or not: ", e);
-                }
-
-                await sleep(1000); // to prevent while loop from going wild
-            }
-
-            obj.students.forEach(async (student) => {
-                let sid = -1;
-                while (true) {
-                    try {
-                        let matched_ids = [];
-                        allStudentObj.forEach((sobj) => {
-                            const pool_tokens = sobj.student_name.split(" ");
-                            const target_tokens = student.split(" ");
-                            pool_tokens.forEach((token) => {
-                                let matched = 0;
-                                target_tokens.forEach((ttoken) => {
-                                    if (token.toLowerCase().trim() == ttoken.toLowerCase().trim()){
-                                        matched+=1;
-                                    }
-                                })
-
-                                // add according to match percentage
-                                if (matched/(target_tokens.length)>0.5) {
-                                    matched_ids.push({match: matched/(target_tokens.length), id: sobj.id});
-                                }
-                            })
-                        })
-
-                        const sorted_matched_ids = matched_ids.sort((a, b) => b.match - a.match);
-                        if (matched_ids.length==1) {
-                            sid = matched_ids[0].id;
-                        } else if (matched_ids.length==0) {
-                            throw new Error("NO MATCH FOR STUDENT : ", student);
-                        } else {
-                            console.log("MULTIPLE MATCHES FOR STUDENT: ", student, " MATCHES: ", JSON.stringify(matched_ids));
-                            if (sorted_matched_ids[0].match == sorted_matched_ids[1].match) {
-                                throw new Error("CANNOT DECIDE for this student");
-                            } else {
-                                sid = sorted_matched_ids[0].id;
-                            }
-                        }
-                        break;
-                    } catch (e){
-                        console.log("Error in finding student in students table: ", e);
-                    }
-                }
-
-                const result = await pool.query(
-                    "SELECT * from student_companies WHERE student_id=($1)",
-                    [sid]
-                )
-                if (result.rows.length==0) {
-                    if (dream) {
-                        await pool.query(
-                            "INSERT INTO student_companies (student_id, student_name, dream_company_id) VALUES ($1, $2, $3)",
-                            [sid, student, cid]
-                        )
-                    } else {
-                        await pool.query(
-                            "INSERT INTO student_companies (student_id, student_name, non_dream_company_id) VALUES ($1, $2, $3)",
-                            [sid, student, cid]
-                        )
-                    }
-                } else {
-                    if (dream) {
-                        const result = await pool.query(
-                            "SELECT dream_company_id FROM student_companies WHERE student_id=($1)",
-                            [sid]
-                        )
-                        if (result.rows[0].dream_company_id) {
-                            throw new Error("TRYING TO UPDATE DREAM COMPANY FOR STUDENT WHO IS ALREADY IN DREAM COMPANY: ", sid, result.rows[0].dream_company_id);
-                        }
-
-                        await pool.query(
-                            "UPDATE student_companies SET dream_company_id=($1) WHERE student_id=($2)",
-                            [cid, sid]
-                        )
-                    } else {
-                        throw new Error("TRYING TO UPDATE NON DREAM COMPANY FOR STUDENT WHO IS ALREADY IN TABLE: ", sid);
-                    }
-                }
-
-                await sleep(1000); // to prevent while loop from going wild
-            })
-        })
-
-        console.log("All messages in parsedMessages processed. Check logs and DB for further information");
+        console.log("Some messages in parsedMessages processed. Check logs and DB for further information");
         
         // Print each message separated by 2 new lines
         // parsedMessages.forEach((message, index) => {
@@ -551,7 +544,7 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
         res.json({ 
             success: true,
             message: 'File processed successfully',
-            messagesCount: parsedMessages.length
+            messagesCount: BATCH_SIZE
         });
 
     } catch (error) {
