@@ -18,8 +18,8 @@ const app = express();
 const PORT = process.env.PORT || 6000;
 const API_KEY = process.env.GEMINI_KEY;
 const DB_URL = process.env.POSTGRES_DB_LINK;
-const lastProcessedPlacement = parse("8/5/25, 12:18 PM", "M/d/yy, h:mm a", new Date()); // this needs to be monitored and updated manually
-const BATCH_SIZE = 10;
+const lastProcessedPlacement = parse("02/10/25, 23:16", "dd/MM/yy, HH:mm", new Date()); // this needs to be monitored and updated manually
+const BATCH_SIZE = 100;
 
 if (!API_KEY) {
     throw new Error("GEMINI_KEY environment variable is not set.");
@@ -328,15 +328,15 @@ async function parseMessage(filteredMessages){
                     if (jsonResponse2.company_name == "") {
                         // need to add company to companies table first
                         await pool.query(
-                            "INSERT INTO Companies (company_name) VALUES ($1)",
+                            "INSERT INTO Companies (company_name) VALUES ($1) ON CONFLICT (company_name) DO NOTHING",
                             [parsedMessages.at(-1).company]
                         )
                     } else {
                         if (jsonResponse2.company_name!=parsedMessages.at(-1).company) {
                             await pool.query(
-                                "INSERT INTO company_alias (company_id, company_name) VALUES ((SELECT id FROM companies WHERE company_name=($1)), ($2))",
+                                "INSERT INTO company_alias (company_id, company_name) VALUES ((SELECT id FROM companies WHERE company_name=($1)), ($2)) ON CONFLICT (company_name) DO NOTHING",
                                 [jsonResponse2.company_name, parsedMessages.at(-1).company]
-                            )
+                            )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
                         }
                     }
                     break;
@@ -488,7 +488,8 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
         // ,\s - matches comma and space
         // \d{1,2}:\d{2}\s - matches time like 5:39 or 12:45 followed by space
         // (AM|PM)\s- - matches AM or PM followed by space and dash
-        const dateTimePattern = /\d{1,2}\/\d{1,2}\/\d{2},\s\d{1,2}:\d{2}\s(AM|PM)\s-/g;
+        // const dateTimePattern = /\d{1,2}\/\d{1,2}\/\d{2},\s\d{1,2}:\d{2}\s(AM|PM)\s-/g;
+        const dateTimePattern = /\d{2}\/\d{2}\/\d{2}, \d{2}:\d{2} -/g;
 
         // Split the text using the regex pattern
         const messages = [];
@@ -499,8 +500,9 @@ app.post('/upload/chat', upload.single('file'), async (req, res) => {
         while ((match = dateTimePattern.exec(fileContent)) !== null) {
             const messageText = fileContent.substring(lastIndex, match.index).trim();
             const messageDateStr = messageText.trim().split('-')[0].trim().replace(' ', ' ');
-            const messageDate = parse(messageDateStr, "M/d/yy, h:mm a", new Date());
+            const messageDate = parse(messageDateStr, "dd/MM/yy, HH:mm", new Date());
             if (messageDate > lastProcessedPlacement) {
+                console.log("Parsed date: ", messageDate, " from string: ", messageDateStr);
                 if (messageText) {
                     messages.push(messageText);
                 }
